@@ -225,11 +225,20 @@ The workflow runs on pull requests, on pushes to `main` and `cursor/**`, and on 
 
 ### Verification status
 
-**Unverified in this repository at the time this paragraph was written.** A green run has not yet been recorded here. The installer is a network stub (`/auto` downloads the real terminal), GitHub-hosted Windows images change, and MetaEditor is a GUI binary. Any of those can fail a run that looks right in review. Until the Actions tab shows a green "MetaEditor compile" job and the artifact contains both `Crypto_4H_30M_Pullback_MT5.ex5` and a log with 0 errors, do not treat CI as evidence that v1.30 compiles.
+**Verified once, on 3 November 2026.** [Actions run 41741433862](https://github.com/netdotx42/PrimeMeta5/actions/runs/41741433862) completed green on `windows-latest`. The compiler log says:
 
-If the first run fails, the log artifact (when the script got as far as producing one) is the thing to read. A signature failure means the publisher check did its job. A missing `Trade.mqh` means the installer layout was not the one the script searches. A log that mentions `#property strict` is I1; an error count above zero is a real compile failure and should be fixed in a later change, not by editing the EA inside a deploy.
+`Result: 0 errors, 0 warnings, 1114 ms elapsed, cpu='X64 Regular'`
 
-Compile for live on the trading terminal even after CI is green. The artifact proves a MetaQuotes MetaEditor accepted the file. It does not prove that build equals the VPS build.
+The `.ex5` and that log were uploaded as the artifact `Crypto_4H_30M_Pullback_MT5-ex5`. MetaEditor's process exit code was 1. On that build the exit code tracked the file count, not the error count, which is why the workflow trusts the log. `#property strict` produced no diagnostic. `Trade.mqh` was included from `C:\Program Files\MetaTrader 5\MQL5\Include\Trade\Trade.mqh` after `terminal64.exe /portable` unpacked it. The log does not print a terminal build number.
+
+Two earlier runs on the same day failed in the workflow, not in the EA, and those failures are why the script looks the way it does:
+
+- [41740874904](https://github.com/netdotx42/PrimeMeta5/actions/runs/41740874904) installed MetaEditor and did not find `Trade.mqh`, because `/auto` does not unpack the standard library until the terminal has started.
+- [41741152944](https://github.com/netdotx42/PrimeMeta5/actions/runs/41741152944) found `Trade.mqh` and passed `/include` the `Include` directory. MetaEditor then looked for `Include\Include\Trade\Trade.mqh` and reported `error 106` (file not found). The documented `/include` value is the `MQL5` directory.
+
+A later push re-runs the job. A green badge on an older commit is not a green badge on a commit that changes the `.mq5`. This verification is for the v1.30 bytes compiled in run 41741433862.
+
+Compile for live on the trading terminal even so. The artifact proves the MetaEditor downloaded that day accepted the file. It does not prove that compiler build is the one installed on the VPS. The installer is still a network stub, and a future image or a future `mt5setup.exe` can break the job without the EA changing.
 
 ## Source list
 

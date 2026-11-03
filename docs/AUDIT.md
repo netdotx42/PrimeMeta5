@@ -2,7 +2,7 @@
 
 Audit date: 3 November 2026. File: `MQL5/Experts/PrimeMeta5/Crypto_4H_30M_Pullback_MT5.mq5`. The file in git is the owner's source, unchanged (SHA-256 `54c0cda7a0a3c233c5e5c4e721f6572784dc044bf75840186a2ede1d72e9178f`). Line numbers below refer to that file.
 
-This is a read of the source against the current MQL5 reference, the MetaEditor command-line help, the MQL5 Virtual Hosting rules and price page, and PrimeXBT's public help and blog posts. The EA was not attached to a PrimeXBT account for this audit. Where a compiler log is available, the deployment plan says so. Patches at the bottom are proposals. None of them are applied.
+This is a read of the source against the current MQL5 reference, the MetaEditor command-line help, the MQL5 Virtual Hosting rules and price page, and PrimeXBT's public help and blog posts. The EA was not attached to a PrimeXBT account. It was compiled once by the GitHub Actions workflow on 3 November 2026: 0 errors, 0 warnings ([run 41741433862](https://github.com/netdotx42/PrimeMeta5/actions/runs/41741433862)). That log is not a backtest and not a live fill. Patches at the bottom are proposals. None of them are applied.
 
 Severity used here:
 
@@ -261,7 +261,9 @@ Handles are created at lines 605–608. If any of them is `INVALID_HANDLE`, init
 
 ### I1. `#property strict` is an MQL4 directive
 
-Line 1. The MQL5 property table lists `version`, `description`, `copyright`, indicator properties, tester properties, and so on. `strict` is not among them ([Program Properties](https://www.mql5.com/en/docs/basis/preprosessor/compilation)). In MQL4 it selected the strict compiler mode. MQL5 is already strict about types and array bounds. A long-standing MQL5 forum reply says the directive is ignored in MQL5 ([forum](https://www.mql5.com/en/forum/425625)). This audit did not treat that reply as a compiler log. Removing the line is safe and is a one-line source change, so it is not done in this repository. If a later MetaEditor reports "unknown property", the compile workflow's log is the place it will show up. It does not change signals.
+Line 1. The MQL5 property table lists `version`, `description`, `copyright`, indicator properties, tester properties, and so on. `strict` is not among them ([Program Properties](https://www.mql5.com/en/docs/basis/preprosessor/compilation)). In MQL4 it selected the strict compiler mode. MQL5 is already strict about types and array bounds. A long-standing MQL5 forum reply says the directive is ignored in MQL5 ([forum](https://www.mql5.com/en/forum/425625)).
+
+The compile workflow's green run on 3 November 2026 is a real compiler log, not that forum reply. MetaEditor from that day's `mt5setup.exe` reported `Result: 0 errors, 0 warnings, 1114 ms elapsed, cpu='X64 Regular'`. There was no "unknown property" line for `strict`. The process exit code was 1, which on that build meant one file compiled, not one error. Removing the line is still a harmless source edit and is not done here. It does not change signals. Run: [41741433862](https://github.com/netdotx42/PrimeMeta5/actions/runs/41741433862).
 
 ### I2. EMA 200 on H4 needs about five weeks of bars, not a magic 35
 
@@ -315,7 +317,7 @@ Not found in those pages, so not stated as fact: the MT5 server name, hedging ve
 
 | Hypothesis | Verdict |
 | --- | --- |
-| `#property strict` is an MQL4 directive. | Confirmed. It is not an MQL5 property. Not shown to be a hard compile error. I1. |
+| `#property strict` is an MQL4 directive. | Confirmed. It is not an MQL5 property. The 3 November 2026 MetaEditor run compiled the file with 0 errors and 0 warnings, so that build did not reject it. I1. |
 | `lastBarTime` is updated before `CheckSignal`, so a transient failure skips the M30 bar. | Confirmed. Includes data-not-ready and a rejected send. H1. |
 | The daily baseline is check-then-set, with no atomic publish, and old keys are never deleted. | Confirmed. The race is real because each EA has its own thread. M1, L1. The more serious hole is the missing entry mutex, H2, and the per-terminal closer, H3. |
 | `SYMBOL_TRADE_FREEZE_LEVEL` is not checked. | Confirmed as a fact about the source. The entry-distance rule that applies to a new market order is the stops level, and `ValidStops` implements it against the live bid or ask. L2. |
@@ -329,7 +331,7 @@ Not found in those pages, so not stated as fact: the MT5 server name, hedging ve
 - Forcing the minimum lot. The source refuses it.
 - Ignoring `SYMBOL_TRADE_STOPS_LEVEL`. It is checked, on the close-price side of the position.
 - Reading a stale `CTrade` retcode. Asynchronous mode is off.
-- The include `Trade/Trade.mqh` and the calls `OrderCalcProfit`, `OrderCalcMargin`, `CalendarValueHistory`, `PositionGetTicket`, and `SetTypeFillingBySymbol`. They are current MQL5 / standard-library APIs. A compile log, once the workflow has one, is the evidence of whether this MetaEditor agrees.
+- The include `Trade/Trade.mqh` and the calls `OrderCalcProfit`, `OrderCalcMargin`, `CalendarValueHistory`, `PositionGetTicket`, and `SetTypeFillingBySymbol`. The 3 November 2026 MetaEditor log included `Trade.mqh` and finished with 0 errors and 0 warnings ([run 41741433862](https://github.com/netdotx42/PrimeMeta5/actions/runs/41741433862)).
 
 ## Recommended patches
 

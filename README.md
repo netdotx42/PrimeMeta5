@@ -90,7 +90,7 @@ LICENSE                                                  placeholder, no licence
 
 ## Build
 
-Compile with MetaEditor on Windows (F7), on the same terminal build you will trade with. The GitHub Actions workflow [`.github/workflows/compile-ea.yml`](.github/workflows/compile-ea.yml) installs MetaTrader 5 on a Windows runner and uploads the `.ex5` as an artifact. Its status for this repository is recorded in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). An artifact is evidence that this source compiled on that runner's MetaEditor. Prefer an `.ex5` built on the machine that will run it.
+Compile with MetaEditor on Windows (F7), on the same terminal build you will trade with. The GitHub Actions workflow [`.github/workflows/compile-ea.yml`](.github/workflows/compile-ea.yml) installs MetaTrader 5 on a Windows runner and uploads the `.ex5` as an artifact. On 3 November 2026 it compiled this source with 0 errors and 0 warnings ([run 41741433862](https://github.com/netdotx42/PrimeMeta5/actions/runs/41741433862)). Details and the two earlier failed attempts are in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Prefer an `.ex5` built on the machine that will run it.
 
 ## Risk disclaimer
 
