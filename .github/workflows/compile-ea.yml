@@ -164,9 +164,13 @@ jobs:
           }
           Write-Host "Using $($trade.FullName)"
 
-          # /include expects the MQL5 directory. #include <Trade/Trade.mqh>
-          # resolves to <that directory>\Include\Trade\Trade.mqh.
-          $mql5 = Split-Path -Parent (Split-Path -Parent $trade.FullName)
+          # Trade.mqh lives at <MQL5>\Include\Trade\Trade.mqh.
+          # /include expects that MQL5 directory: the compiler appends \Include\.
+          $mql5 = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $trade.FullName))
+          $includeProbe = Join-Path $mql5 "Include\Trade\Trade.mqh"
+          if (-not (Test-Path -LiteralPath $includeProbe)) {
+            throw "Computed MQL5 root '$mql5' does not contain Include\Trade\Trade.mqh (found $($trade.FullName))."
+          }
           Write-Host "Standard library root: $mql5"
           $destDir = Join-Path $mql5 "Experts\PrimeMeta5"
           New-Item -ItemType Directory -Force -Path $destDir | Out-Null
