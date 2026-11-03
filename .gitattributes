@@ -1,0 +1,3 @@
+# Keep the owner's source and note byte-for-byte (LF, as committed).
+MQL5/Experts/PrimeMeta5/*.mq5 text eol=lf
+docs/PRIMEXBT_STANDARD_README.txt text eol=lf
