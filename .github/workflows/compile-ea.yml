@@ -1,0 +1,167 @@
+# Compile the EA with MetaEditor on a GitHub-hosted Windows runner.
+#
+# MetaEditor is a Windows GUI program. The documented flags are /compile,
+# /include, and /log (MetaEditor Help, "Integration with other IDEs").
+# Judge the Unicode log, not the process exit code: that code has been
+# observed to count compiled files rather than errors.
+#
+# The MetaQuotes installer is downloaded on every run. It is accepted only
+# when Authenticode status is Valid and the publisher name contains
+# "MetaQuotes". The installer bytes change per download, so this workflow
+# does not pin a file hash.
+#
+# Until a green run is recorded for this repository, treat the workflow as
+# unverified. docs/DEPLOYMENT.md is the place that status is written down.
+
+name: Compile EA
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'cursor/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: MetaEditor compile
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download and verify the MetaTrader 5 installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
+          $out = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          $len = (Get-Item $out).Length
+          Write-Host "Installer bytes: $len"
+          if ($len -lt 100000) { throw "Installer is too small ($len bytes)." }
+
+          $sig = Get-AuthenticodeSignature -LiteralPath $out
+          $publisher = ""
+          if ($null -ne $sig.SignerCertificate) {
+            $publisher = $sig.SignerCertificate.GetNameInfo(
+              [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+              $false)
+          }
+          Write-Host "Authenticode status: $($sig.Status)"
+          Write-Host "Publisher: $publisher"
+          if ($sig.Status -ne "Valid") {
+            throw "Refusing to run an installer whose signature status is $($sig.Status)."
+          }
+          if ($publisher -notmatch "MetaQuotes") {
+            throw "Refusing to run an installer published by '$publisher'."
+          }
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "MT5_SETUP=$out`n")
+
+      - name: Install MetaTrader 5 and find MetaEditor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $proc = Start-Process -FilePath $env:MT5_SETUP -ArgumentList "/auto" -PassThru
+          if (-not $proc.WaitForExit(600000)) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "mt5setup.exe did not exit within 10 minutes."
+          }
+          Write-Host "Installer process exit code: $($proc.ExitCode)"
+
+          $roots = @(
+            ${env:ProgramFiles},
+            ${env:ProgramFiles(x86)},
+            $env:LOCALAPPDATA,
+            $env:APPDATA
+          ) | Where-Object { $_ -and (Test-Path $_) }
+
+          $meta = $null
+          $deadline = (Get-Date).AddMinutes(8)
+          while ((Get-Date) -lt $deadline -and -not $meta) {
+            foreach ($root in $roots) {
+              $found = Get-ChildItem -Path $root -Filter "metaeditor64.exe" -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+              if ($found) { $meta = $found.FullName; break }
+            }
+            if (-not $meta) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $meta) {
+            Write-Host "metaeditor64.exe was not found. Top of Program Files:"
+            Get-ChildItem ${env:ProgramFiles} -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            throw "metaeditor64.exe was not found after the installer exited."
+          }
+          Write-Host "MetaEditor: $meta"
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "METAEDITOR=$meta`n")
+          Get-Process terminal64, metaeditor64 -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+
+      - name: Compile the Expert Advisor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
+
+          $editorDir = Split-Path -Parent $env:METAEDITOR
+          $searchRoots = @(
+            (Join-Path $editorDir "MQL5"),
+            $editorDir,
+            $env:APPDATA,
+            $env:LOCALAPPDATA
+          ) | Where-Object { $_ -and (Test-Path $_) }
+
+          $trade = $null
+          foreach ($root in $searchRoots) {
+            $hit = Get-ChildItem -Path $root -Filter "Trade.mqh" -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match "\\Include\\Trade\\Trade.mqh$" } |
+              Select-Object -First 1
+            if ($hit) { $trade = $hit; break }
+          }
+          if (-not $trade) {
+            Write-Host "Contents of $editorDir :"
+            Get-ChildItem $editorDir -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            throw "Include\Trade\Trade.mqh was not found. The EA cannot be compiled without the standard library."
+          }
+
+          # /include expects the MQL5 directory. #include <Trade/Trade.mqh>
+          # resolves to <that directory>\Include\Trade\Trade.mqh.
+          $mql5 = Split-Path -Parent (Split-Path -Parent $trade.FullName)
+          Write-Host "Standard library root: $mql5"
+          $destDir = Join-Path $mql5 "Experts\PrimeMeta5"
+          New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+          $src = Join-Path $destDir "Crypto_4H_30M_Pullback_MT5.mq5"
+          Copy-Item -Force "MQL5\Experts\PrimeMeta5\Crypto_4H_30M_Pullback_MT5.mq5" $src
+
+          $argLine = "/compile:`"$src`" /include:`"$mql5`" /log"
+          Write-Host "metaeditor64.exe $argLine"
+          $proc = Start-Process -FilePath $env:METAEDITOR -ArgumentList $argLine -PassThru -Wait
+          Write-Host "MetaEditor exit code: $($proc.ExitCode) (not used as the pass/fail signal)"
+
+          $log = Join-Path $destDir "Crypto_4H_30M_Pullback_MT5.log"
+          if (-not (Test-Path $log)) { throw "MetaEditor did not write $log" }
+          $text = Get-Content -Encoding Unicode -Raw -LiteralPath $log
+          Write-Host $text
+          Copy-Item -Force $log "artifacts\compile.log"
+
+          $ex5 = Join-Path $destDir "Crypto_4H_30M_Pullback_MT5.ex5"
+          $compiled = ($text -match "0 error") -and (Test-Path $ex5)
+          if (-not $compiled) {
+            throw "Compile did not report 0 errors or did not produce an .ex5."
+          }
+          Copy-Item -Force $ex5 "artifacts\Crypto_4H_30M_Pullback_MT5.ex5"
+          Write-Host "Compiled artifact: artifacts\Crypto_4H_30M_Pullback_MT5.ex5"
+
+      - name: Upload the .ex5 and the compiler log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crypto_4H_30M_Pullback_MT5-ex5
+          path: artifacts/**
+          if-no-files-found: warn
