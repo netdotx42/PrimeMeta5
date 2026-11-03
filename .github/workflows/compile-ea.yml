@@ -110,25 +110,59 @@ jobs:
           New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
 
           $editorDir = Split-Path -Parent $env:METAEDITOR
-          $searchRoots = @(
-            (Join-Path $editorDir "MQL5"),
-            $editorDir,
-            $env:APPDATA,
-            $env:LOCALAPPDATA
-          ) | Where-Object { $_ -and (Test-Path $_) }
 
-          $trade = $null
-          foreach ($root in $searchRoots) {
-            $hit = Get-ChildItem -Path $root -Filter "Trade.mqh" -Recurse -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match "\\Include\\Trade\\Trade.mqh$" } |
-              Select-Object -First 1
-            if ($hit) { $trade = $hit; break }
+          function Find-TradeMqh {
+            $portable = Join-Path $editorDir "MQL5\Include\Trade\Trade.mqh"
+            if (Test-Path -LiteralPath $portable) { return (Get-Item -LiteralPath $portable) }
+            $terminalRoot = Join-Path $env:APPDATA "MetaQuotes\Terminal"
+            if (Test-Path -LiteralPath $terminalRoot) {
+              $hit = Get-ChildItem -Path $terminalRoot -Filter "Trade.mqh" -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match "\\MQL5\\Include\\Trade\\Trade.mqh$" } |
+                Select-Object -First 1
+              if ($hit) { return $hit }
+            }
+            return $null
+          }
+
+          # mt5setup.exe /auto lays down the executables only. The standard
+          # library appears when the terminal creates its data folder.
+          $trade = Find-TradeMqh
+          if (-not $trade) {
+            $term = Join-Path $editorDir "terminal64.exe"
+            Write-Host "Trade.mqh is not on disk yet. Starting terminal64.exe so it unpacks MQL5."
+            $tp = Start-Process -FilePath $term -ArgumentList "/portable" -PassThru
+            $deadline = (Get-Date).AddMinutes(4)
+            while ((Get-Date) -lt $deadline -and -not $trade) {
+              Start-Sleep -Seconds 5
+              $trade = Find-TradeMqh
+              Write-Host "Still waiting for Trade.mqh"
+            }
+            if (-not $trade) {
+              Write-Host "Portable start did not unpack Include. Starting a normal terminal."
+              if ($tp -and -not $tp.HasExited) { Stop-Process -Id $tp.Id -Force -ErrorAction SilentlyContinue }
+              $tp = Start-Process -FilePath $term -PassThru
+              $deadline = (Get-Date).AddMinutes(4)
+              while ((Get-Date) -lt $deadline -and -not $trade) {
+                Start-Sleep -Seconds 5
+                $trade = Find-TradeMqh
+                Write-Host "Still waiting for Trade.mqh (AppData)"
+              }
+            }
+            Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            if (-not $trade) { $trade = Find-TradeMqh }
           }
           if (-not $trade) {
-            Write-Host "Contents of $editorDir :"
-            Get-ChildItem $editorDir -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            Write-Host "Contents of ${editorDir}:"
+            Get-ChildItem -LiteralPath $editorDir -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            $mq = Join-Path $env:APPDATA "MetaQuotes"
+            if (Test-Path $mq) {
+              Write-Host "Contents of ${mq}:"
+              Get-ChildItem -LiteralPath $mq -Recurse -Depth 2 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            }
             throw "Include\Trade\Trade.mqh was not found. The EA cannot be compiled without the standard library."
           }
+          Write-Host "Using $($trade.FullName)"
 
           # /include expects the MQL5 directory. #include <Trade/Trade.mqh>
           # resolves to <that directory>\Include\Trade\Trade.mqh.
