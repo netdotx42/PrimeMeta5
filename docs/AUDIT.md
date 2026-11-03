@@ -1,8 +1,8 @@
-# Audit: Crypto_4H_30M_Pullback_MT5 v1.30
+# Audit: Crypto_4H_30M_Pullback_MT5
 
-Audit date: 3 November 2026. File: `MQL5/Experts/PrimeMeta5/Crypto_4H_30M_Pullback_MT5.mq5`. The file in git is the owner's source, unchanged (SHA-256 `54c0cda7a0a3c233c5e5c4e721f6572784dc044bf75840186a2ede1d72e9178f`). Line numbers below refer to that file.
+Audit date: 3 November 2026, against v1.30. The line numbers in the narrative below are the v1.30 file (SHA-256 `54c0cda7a0a3c233c5e5c4e721f6572784dc044bf75840186a2ede1d72e9178f`). v1.40 applies the high and medium findings. The resolution is the table in the next section, and the code is the source of truth. The patch sketches further down were the v1.30 proposals; v1.40 follows them where they still matched the file, and differs where an input was the safer choice.
 
-This is a read of the source against the current MQL5 reference, the MetaEditor command-line help, the MQL5 Virtual Hosting rules and price page, and PrimeXBT's public help and blog posts. The EA was not attached to a PrimeXBT account. It was compiled once by the GitHub Actions workflow on 3 November 2026: 0 errors, 0 warnings ([run 41741433862](https://github.com/netdotx42/PrimeMeta5/actions/runs/41741433862)). That log is not a backtest and not a live fill. Patches at the bottom are proposals. None of them are applied.
+v1.30 was not attached to a PrimeXBT account. It compiled on 3 November 2026 with 0 errors and 0 warnings ([run 41741433862](https://github.com/netdotx42/PrimeMeta5/actions/runs/41741433862)). That log is not a backtest and not a live fill.
 
 Severity used here:
 
@@ -16,20 +16,20 @@ Severity used here:
 
 ## Findings at a glance
 
-| ID | Sev. | What |
-| --- | --- | --- |
-| H1 | High | `lastBarTime` is updated before `CheckSignal`, so one failed read or one rejected send skips that M30 bar. |
-| H2 | High | Charts do not share an entry lock. Four symbols can each pass the 0.5% check before any fill, and two charts of one symbol can both send. |
-| H3 | High | The daily closer only closes this magic on this chart's symbol, and the lock lives in this terminal's global variables. |
-| M1 | Medium | The daily baseline is check-then-set. `OnInit` publishes it immediately. A later chart can overwrite it. |
-| M2 | Medium | `OrderCalcProfit` sizes the stop distance only. Swap, administrative fees, and a worse fill are outside the 0.5%. |
-| M3 | Medium | The baseline is account equity, so floating PnL, deposits, withdrawals, and swap move the lock. |
-| M4 | Medium | A baseline stored as 0 or less is kept for the whole server day and is treated as a tripped limit, including the closer. |
-| M5 | Medium | A successful return code is logged as "opened" without reading the position's stop and target. `TRADE_RETCODE_PLACED` counts as success. |
-| M6 | Medium | Only `SYMBOL_TRADE_MODE_DISABLED` is rejected. Filling mode is whatever `SetTypeFillingBySymbol` picks, with no fallback. The allowlist is an exact, case-sensitive match. |
-| M7 | Medium | A one-symbol Strategy Tester run does not exercise the multi-chart lock. "Open prices only" is the wrong model for an EA that uses stops. |
-| M8 | Medium | The first tick of a bar enters even if that tick is late. A restart does the opposite and skips the forming bar. |
-| M9 | Medium | Turning algorithmic trading off also stops the protective close. `OnTick` does not check the permission before `PositionClose`. |
+| ID | Sev. | v1.40 | What |
+| --- | --- | --- | --- |
+| H1 | High | Fixed | `lastBarTime` was updated before `CheckSignal`, so one failed read or one rejected send skipped that M30 bar. |
+| H2 | High | Fixed | Charts did not share an entry lock. Four symbols could each pass the 0.5% check before any fill, and two charts of one symbol could both send. |
+| H3 | High | Partial | The daily closer only closed this magic on this chart's symbol, and the lock lives in this terminal's global variables. |
+| M1 | Medium | Fixed | The daily baseline was check-then-set. `OnInit` published it immediately. A later chart could overwrite it. |
+| M2 | Medium | Partial | `OrderCalcProfit` sizes the stop distance only. Swap and a worse fill can still exceed the 0.5%. |
+| M3 | Medium | Partial | The baseline is account equity. Floating PnL and swap still move the lock. Deposits and withdrawals no longer do, by default. |
+| M4 | Medium | Fixed | A baseline stored as 0 or less was kept for the whole server day and treated as a tripped limit, including the closer. |
+| M5 | Medium | Fixed | A successful return code was logged as "opened" without reading the position's stop and target. `TRADE_RETCODE_PLACED` counted as success. |
+| M6 | Medium | Partial | Only a disabled trade mode was rejected. Filling mode had no fallback. The allowlist is still an exact, case-sensitive match. |
+| M7 | Medium | Partial | A one-symbol Strategy Tester run does not exercise the multi-chart lock. "Open prices only" is still the wrong model for stops. |
+| M8 | Medium | Fixed | The first tick of a bar entered even if that tick was late. A restart skipped the forming bar with no log. |
+| M9 | Medium | Partial | Turning algorithmic trading off still stops the protective close. The EA now alerts and retries instead of failing quietly. |
 | L1 | Low | Yesterday's `PXBTSTD_CRYPTO_*` global variables are never deleted. |
 | L2 | Low | `SYMBOL_TRADE_FREEZE_LEVEL` is never read. New-order distance is governed by the stops level, which is checked. |
 | L3 | Low | `DeviationPoints` and a magic of 0 are not rejected. A negative deviation converts into a large `ulong`. |
@@ -45,7 +45,26 @@ Severity used here:
 | I6 | Info | The 30% margin cap is per order. Free margin is the check that sees orders already open. |
 | I7 | Info | PrimeXBT public facts that touch this EA, and the questions those pages do not answer. |
 
-No critical finding. On the path that actually sends an order, the EA calculates a stop, rejects a stop that is on the wrong side or inside `SYMBOL_TRADE_STOPS_LEVEL` of the live bid or ask, sizes from that stop, and sends the stop and target on the same `CTrade` request. `SetAsyncMode(false)` is set, so the retcode comes from that call. That is not a naked-order bug by itself. M5 is the residual: the position is not read back after the fill.
+## v1.40 resolution
+
+The narrative under each finding describes v1.30. This is what v1.40 does with the high and medium items. Low and info items were left as written, except L3: magic `0` and a negative deviation are now rejected because H3 and M2 need that.
+
+| ID | Status | How, and what remains |
+| --- | --- | --- |
+| H1 | Fixed | `OnTick` writes `lastBarTime` only after `CheckSignal` returns done. A short history read, a missing quote, and a transient retcode (`REQUOTE`, `PRICE_OFF`, `PRICE_CHANGED`, `TIMEOUT`, `CONNECTION`, `TRADE_CONTEXT_BUSY`, `TOO_MANY_REQUESTS`, `CLIENT_DISABLES_AT`) leave the bar open. `IndicatorsReady` requires synchronized H4 and M30 series and enough calculated bars for EMA 200. |
+| H2 | Fixed | `Acquire` on `PXBTSTD_CRYPTO_<login>_ENTRY` is held across the re-check and the send. Inside it, the EA re-reads positions, refuses a second position on the symbol, enforces `MaxOpenPositions` (default 4) and `MaxTotalRiskPercent` (default 2, so four 0.5% stops still fit), and refreshes the entry price before sizing. A stuck lock can be taken after 30 seconds. Lower the cap if four correlated positions are too much; the default does not do that for you. |
+| H3 | Partial | `CloseAllMagicOnDailyLock` defaults to true, so any ticking chart closes every position with this magic. End-of-day close is still this symbol only. The baseline and the lock are still terminal global variables. A second terminal, a closed terminal, and a chart that never ticks do not flatten the book. Magic `0` is rejected so the wider close cannot grab manual trades. |
+| M1 | Fixed | `EnsureDailyBaseline` takes a per-day guard with `GlobalVariableSetOnCondition` and only the holder writes. Everyone else reads. The guard value is a timestamp and can be stolen after 5 seconds. The baseline is not a temporary variable, so a restart the same server day keeps it. |
+| M2 | Partial | `ExtraCostPerLot` (default 0) is added per lot before the volume division. The journal logs `ResultPrice()` and `ResultVolume()`. Negative deviation is rejected. Swap is still absent, because hold time is not known at entry. A fill inside `DeviationPoints` can still lose more than `RiskPercent`. |
+| M3 | Partial | `ExcludeNonTradeCashflows` defaults to true. Balance, credit, bonus, and correction deals after the baseline timestamp are subtracted from equity before the percent is computed. Floating PnL and swap still count, so an open loss can still trip the lock and a large open profit can still set a high baseline. That is the protective reading of a daily equity limit. Set the input false to restore the v1.30 comparison. A baseline written by v1.30 has no timestamp; v1.40 stamps it at the first run and only adjusts cashflows after that. |
+| M4 | Fixed | A stored baseline of 0 or less is deleted. `DAILY_NO_BASELINE` blocks new entries and does not call the closer. The closer runs only after a positive baseline has been breached, or when the lock key already exists. |
+| M5 | Fixed | Success is `DONE` or `DONE_PARTIAL` only. `PLACED` is logged as not opened and does not send again on that bar. The position is then read. With `VerifyStopsAfterFill` (default true), a missing stop or target is closed, including on later ticks for this symbol. Turn the input off if a broker attaches stops after the deal comes back and the safety close is firing on good trades. |
+| M6 | Partial | Init fails for `SYMBOL_TRADE_MODE_DISABLED` and `CLOSEONLY`, and prints trade mode, filling flags, account margin mode, stops level, and freeze level. A long-only or short-only symbol skips the disallowed direction. `INVALID_FILL` is tried once each as IOC, FOK, and RETURN. The allowlist is still exact and case-sensitive. `PositionSelect` still blocks when any position exists on the symbol. |
+| M7 | Partial | `OnInit` in the tester prints that one pass is not a four-chart test and that open-prices mode does not model stops. The news filter is still bypassed there. Global variables in the tester are still per agent and still disappear with the pass. Nothing in the EA can make the single-symbol tester share a baseline across symbols. |
+| M8 | Fixed | The same `MaxEntryDelaySeconds` window refuses a late tick and logs the skip. If `iTime` is 0 at init, the first bar that later appears is skipped. If init can see the open bar, that bar is skipped, as in v1.30, and the skip is now logged. |
+| M9 | Partial | Before a protective close the EA checks algorithmic-trading permission. When it is off, it prints and alerts at most once a minute and tries on a later tick. A failed `PositionClose` alerts the same way. The platform still rejects the request until the button is on. Closing from the Trade tab is still the emergency flatten. |
+
+No critical finding in v1.30. On the path that sent an order, that version calculated a stop, rejected a stop inside `SYMBOL_TRADE_STOPS_LEVEL` of the live bid or ask, sized from that stop, and sent the stop and target on the same `CTrade` request. It did not read the position back. v1.40 does, when `VerifyStopsAfterFill` is on. The sections below are the v1.30 analysis.
 
 ## High
 
