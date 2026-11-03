@@ -289,7 +289,8 @@ bool TransientRetcode(uint code)
           code == TRADE_RETCODE_PRICE_CHANGED ||
           code == TRADE_RETCODE_TIMEOUT ||
           code == TRADE_RETCODE_CONNECTION ||
-          code == TRADE_RETCODE_TRADE_CONTEXT_BUSY ||
+          code == TRADE_RETCODE_LOCKED ||
+          code == TRADE_RETCODE_FROZEN ||
           code == TRADE_RETCODE_TOO_MANY_REQUESTS ||
           code == TRADE_RETCODE_CLIENT_DISABLES_AT ||
           code == 0;
