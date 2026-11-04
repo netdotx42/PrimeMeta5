@@ -1,6 +1,6 @@
 # PrimeMeta5
 
-Expert Advisor for a PrimeXBT MT5 Standard account: H4 EMA(50)/EMA(200) trend, M30 EMA(20) pullback, swing stop, 2R target, and equity-based sizing. Version **1.40**. The entry rules are the v1.30 rules. The risk controls around them are the H1–H3 and M1–M9 fixes in [CHANGELOG.md](CHANGELOG.md).
+Expert Advisor for a PrimeXBT MT5 Standard account: H4 EMA(50)/EMA(200) trend, M30 EMA(20) pullback, swing stop, 2R target, and equity-based sizing. Version **1.41**. The entry rules are the v1.30 rules. Risk controls are in [CHANGELOG.md](CHANGELOG.md).
 
 Leveraged crypto CFDs can wipe out a deposit. Nothing here is a promise of profit, a backtest, or a recommendation to trade. Read [docs/AUDIT.md](docs/AUDIT.md) before attaching this to a live account. The 0.5% input is the risk of **one** position. `MaxTotalRiskPercent` (default 2) is the sum of stop-risk this terminal will add to, and `MaxOpenPositions` (default 4) is how many of this magic may be open. The 2% daily figure, on this terminal only, closes every symbol that uses this magic when `CloseAllMagicOnDailyLock` is true. It is not a guaranteed cap on loss, and a second terminal does not see the lock.
 
@@ -69,8 +69,31 @@ Defaults are the values in the source.
 | `ExcludeNonTradeCashflows` | `true` | Remove balance, credit, bonus, and correction deals from the daily-loss comparison. Floating PnL and swap still count. |
 | `CloseAllMagicOnDailyLock` | `true` | When the daily lock trips, every live chart closes all symbols with this magic. Other terminals are not affected. |
 | `VerifyStopsAfterFill` | `true` | If a position with this magic on this symbol has no stop or no target, close it. |
+| `EaCommand` | `Running` | `Running`, `Paused` (no new entries, protection stays), or `Flatten` (close this magic and do not re-enter). |
+| `IncludeSwapInRisk` | `true` | Add the estimated adverse swap over `MaxHoldHours` to the loss used for volume. |
+| `MaxHoldHours` | `48` | Hold window for that swap estimate. Also the age limit when `CloseAfterMaxHold` is on. |
+| `CloseAfterMaxHold` | `false` | Close this symbol's positions older than `MaxHoldHours`. |
+| `MaxSwapToRiskPercent` | `50` | Skip the entry when estimated swap is more than this percent of the cash risk. `0` disables the skip. |
+| `ExitBeforeTripleSwap` | `false` | Close this symbol shortly before a triple-swap night. |
+| `SwapChargeHour` | `21` | Broker-server hour of the swap charge. Used only by the optional triple-swap exit. Confirm it on the symbol. |
+| `SwapChargeMinute` | `0` | Broker-server minute of that charge. |
+| `ExitMinutesBeforeSwap` | `15` | How early the optional triple-swap exit starts. |
+| `SizeForSlippage` | `true` | Size the trade from an entry `SlippageAllowancePoints` worse than the live quote. The order still uses the real swing stop and a 2R target from the live quote. |
+| `SlippageAllowancePoints` | `20` | Those extra adverse points. `0` disables the allowance. |
+| `MaxAdverseSlippagePoints` | `20` | Close the new fill when adverse slippage exceeds this many points. `0` disables. |
+| `MaxAdverseSlippageStopPercent` | `25` | Close the new fill when adverse slippage exceeds this percent of the stop distance. `0` disables. |
+| `TightenStopsNearDailyLimit` | `true` | While algorithmic trading is on, move stops closer once daily loss reaches `DailyLimitTightenPercent` of the limit. |
+| `DailyLimitTightenPercent` | `75` | That threshold, as a percent of `DailyLossLimitPercent`. |
+| `AlertOnAlgoOff` | `true` | Alert when Algo Trading is off. |
+| `PushOnAlgoOff` | `true` | `SendNotification` when it turns off. Needs a MetaQuotes ID in the terminal. |
+| `EmailOnAlgoOff` | `false` | `SendMail` when it turns off. Needs the terminal's email settings. |
+| `WriteHeartbeat` | `true` | Update terminal global variables a watchdog can read. |
+| `WriteHeartbeatFile` | `true` | Also write `MQL5/Files/PrimeMeta5_<login>.heartbeat.txt`. |
+| `HeartbeatSeconds` | `10` | Minimum gap between heartbeat updates. |
 
-`OnInit` rejects a magic of 0, a negative deviation, out-of-range periods, a non-positive reward, a fast EMA that is not shorter than the slow EMA, a minimum ATR percent that sits above a positive maximum, a margin cap outside `(0, 100]`, and out-of-range values for the v1.40 caps. A symbol whose trade mode is disabled or close-only fails init. Long-only and short-only symbols are logged and the disallowed direction is skipped.
+The chart comment shows `RUNNING`, `PAUSED`, `LOCKED`, `FLATTEN`, or `ALGO_OFF`. There is no DLL. A server-side stop is still the protection that works after the Algo Trading button is turned off.
+
+`OnInit` rejects a magic of 0, a negative deviation, out-of-range periods, a non-positive reward, a fast EMA that is not shorter than the slow EMA, a minimum ATR percent that sits above a positive maximum, a margin cap outside `(0, 100]`, and out-of-range values for the v1.40 and v1.41 caps. A symbol whose trade mode is disabled or close-only fails init. Long-only and short-only symbols are logged and the disallowed direction is skipped.
 
 ## Install
 

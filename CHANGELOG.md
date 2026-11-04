@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.41
+
+Entry rules are unchanged from 1.40.
+
+| ID | What changed |
+| --- | --- |
+| M2 | Sizing can include the symbol's swap over `MaxHoldHours` (default 48) and a worse entry `SlippageAllowancePoints` beyond the quote (default 20, on). A negative swap is a charge. A positive swap is not used to increase size. Weekday swap ratios are used when the symbol publishes them, otherwise one night counts as one day and the triple-swap weekday counts as three. The estimate is converted to account currency with `OrderCalcProfit`. If that conversion fails, the entry is skipped. `MaxSwapToRiskPercent` (default 50) skips a trade whose estimated swap is more than half of the cash risk. After a fill, adverse slippage beyond `MaxAdverseSlippagePoints` (default 20) or `MaxAdverseSlippageStopPercent` of the stop distance (default 25) closes the position. `CloseAfterMaxHold` and `ExitBeforeTripleSwap` default off, so positions are not closed on a timer unless you opt in. `SwapChargeHour` / `SwapChargeMinute` default to 21:00 broker-server time and are used only for that optional exit. |
+| M9 | The EA cannot turn the Algo Trading button on, and this build does not include a DLL or a keystroke tool. While the button is on, every accepted entry still carries a server-side stop and target, and `TightenStopsNearDailyLimit` (default on) pulls those stops closer once the daily loss reaches 75% of the limit, or closes a position whose stop cannot legally be tightened enough. `EaCommand` is Running, Paused, or Flatten. The chart shows RUNNING, PAUSED, LOCKED, FLATTEN, or ALGO_OFF. Turning the button off raises an Alert, a push (`SendNotification`, on by default), and an email only if `EmailOnAlgoOff` is on. The next tick after the button comes back runs the pending closes and stop updates. A heartbeat global variable is refreshed, and by default a text file is written under `MQL5/Files` for an external watchdog. |
+
 ## 1.40
 
 Entry rules are unchanged: H4 EMA 50/200 trend, M30 EMA 20 pullback, bullish or bearish close, break of the prior M30 candle, swing stop, 2R target.
