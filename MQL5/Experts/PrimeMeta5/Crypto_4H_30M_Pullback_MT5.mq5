@@ -1,5 +1,5 @@
 #property strict
-#property version "1.40"
+#property version "1.41"
 #property description "H4 trend + M30 pullback crypto EA with ATR and spread protection"
 
 #include <Trade/Trade.mqh>
@@ -62,6 +62,36 @@ input bool   ExcludeNonTradeCashflows = true; // M3. Ignore balance, credit, bon
 input bool   CloseAllMagicOnDailyLock = true; // H3. On the lock, close every symbol with this magic. This terminal only.
 input bool   VerifyStopsAfterFill = true;     // M5. Close our position on this symbol if the stop or target is missing.
 
+// ---- v1.41 swap, slippage, and algo-off protection (entry rules unchanged) ----
+enum ENUM_EA_COMMAND
+{
+   EA_CMD_RUNNING = 0,   // Running
+   EA_CMD_PAUSED  = 1,   // Paused: no new entries, protection stays on
+   EA_CMD_FLATTEN = 2    // Flatten: close this magic and take no new entries
+};
+
+input ENUM_EA_COMMAND EaCommand = EA_CMD_RUNNING;
+input bool   IncludeSwapInRisk = true;             // M2. Add the estimated swap charge over MaxHoldHours to the sizing loss.
+input int    MaxHoldHours = 48;                    // M2. Window used to estimate swap. Also the age limit when CloseAfterMaxHold is on.
+input bool   CloseAfterMaxHold = false;            // M2. Close this symbol's positions older than MaxHoldHours. Off keeps the original exit.
+input double MaxSwapToRiskPercent = 50.0;          // M2. Skip when estimated swap exceeds this percent of the cash risk. 0 disables the skip.
+input bool   ExitBeforeTripleSwap = false;         // M2. Close this symbol before a triple-swap charge. Off by default.
+input int    SwapChargeHour = 21;                  // M2. Broker-server hour of the daily swap charge. Match the symbol specification.
+input int    SwapChargeMinute = 0;                 // M2. Broker-server minute of that charge.
+input int    ExitMinutesBeforeSwap = 15;           // M2. Used only when ExitBeforeTripleSwap is on.
+input bool   SizeForSlippage = true;               // M2. Size from a worse entry, SlippageAllowancePoints beyond the quote.
+input int    SlippageAllowancePoints = 20;         // M2. Extra adverse points assumed in the worst-case entry. 0 disables that allowance.
+input int    MaxAdverseSlippagePoints = 20;        // M2. Close the fill when adverse slippage exceeds this many points. 0 disables.
+input double MaxAdverseSlippageStopPercent = 25.0; // M2. Close when adverse slippage exceeds this percent of the stop distance. 0 disables.
+input bool   TightenStopsNearDailyLimit = true;    // M9. While trading is allowed, pull stops in once the daily loss reaches the threshold below.
+input double DailyLimitTightenPercent = 75.0;      // M9. Percent of the daily-loss limit at which stops start tightening.
+input bool   AlertOnAlgoOff = true;                // M9. Alert when Algo Trading turns off.
+input bool   PushOnAlgoOff = true;                 // M9. SendNotification. Requires a MetaQuotes ID in the terminal.
+input bool   EmailOnAlgoOff = false;               // M9. SendMail. Requires the terminal email settings. Off by default.
+input bool   WriteHeartbeat = true;                // M9. Refresh a terminal global variable an external watchdog can read.
+input bool   WriteHeartbeatFile = true;            // M9. Also write MQL5/Files/PrimeMeta5_<login>.heartbeat.txt
+input int    HeartbeatSeconds = 10;                // M9. Minimum seconds between heartbeat updates.
+
 // ---- Indicator handles ----
 int hFast = INVALID_HANDLE;
 int hSlow = INVALID_HANDLE;
@@ -74,6 +104,8 @@ datetime nextCloseAlert = 0;
 datetime nextHistoryLog = 0;
 bool     entryLockHeld = false;
 string   baselineGuardHeld = "";
+int      lastAlgoFlag = -1;
+datetime lastHeartbeat = 0;
 
 enum EvalKind
 {
@@ -297,9 +329,203 @@ bool TransientRetcode(uint code)
 }
 
 //+------------------------------------------------------------------+
-//| Price loss for 1.0 lot, plus the optional per-lot cost.          |
+double NormalizePriceSymbol(const string symbol, double price)
+{
+   double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   if(tickSize <= 0.0)
+      return NormalizeDouble(price, digits);
+   price = MathRound(price / tickSize) * tickSize;
+   return NormalizeDouble(price, digits);
+}
+
 //+------------------------------------------------------------------+
-bool LossPerLot(ENUM_ORDER_TYPE orderType, double entry, double stop, double &lossPerLot)
+bool AccountValueOf(const string symbol, double amount, const string currency, double price, double &accountValue)
+{
+   accountValue = 0.0;
+   if(amount <= 0.0)
+      return true;
+
+   string deposit = AccountInfoString(ACCOUNT_CURRENCY);
+   if(currency == deposit)
+   {
+      accountValue = amount;
+      return true;
+   }
+
+   double contract = SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   if(contract <= 0.0 || price <= 0.0)
+      return false;
+
+   string baseCcy = SymbolInfoString(symbol, SYMBOL_CURRENCY_BASE);
+   string profitCcy = SymbolInfoString(symbol, SYMBOL_CURRENCY_PROFIT);
+   double priceDiff = 0.0;
+   if(currency == profitCcy)
+      priceDiff = amount / contract;
+   else if(currency == baseCcy)
+      priceDiff = amount * price / contract;
+   else
+      return false;
+
+   double profit = 0.0;
+   if(!OrderCalcProfit(ORDER_TYPE_BUY, symbol, 1.0, price, price + priceDiff, profit))
+      return false;
+   accountValue = MathAbs(profit);
+   return true;
+}
+
+//+------------------------------------------------------------------+
+double NightRatio(const string symbol, ENUM_DAY_OF_WEEK day)
+{
+   double sunday = SymbolInfoDouble(symbol, SYMBOL_SWAP_SUNDAY);
+   double monday = SymbolInfoDouble(symbol, SYMBOL_SWAP_MONDAY);
+   double tuesday = SymbolInfoDouble(symbol, SYMBOL_SWAP_TUESDAY);
+   double wednesday = SymbolInfoDouble(symbol, SYMBOL_SWAP_WEDNESDAY);
+   double thursday = SymbolInfoDouble(symbol, SYMBOL_SWAP_THURSDAY);
+   double friday = SymbolInfoDouble(symbol, SYMBOL_SWAP_FRIDAY);
+   double saturday = SymbolInfoDouble(symbol, SYMBOL_SWAP_SATURDAY);
+   bool specified = (sunday + monday + tuesday + wednesday + thursday + friday + saturday) > 0.0;
+
+   if(!specified)
+   {
+      ENUM_DAY_OF_WEEK triple = (ENUM_DAY_OF_WEEK)SymbolInfoInteger(symbol, SYMBOL_SWAP_ROLLOVER3DAYS);
+      return (day == triple) ? 3.0 : 1.0;
+   }
+
+   double ratio = 0.0;
+   switch(day)
+   {
+      case SUNDAY:    ratio = sunday; break;
+      case MONDAY:    ratio = monday; break;
+      case TUESDAY:   ratio = tuesday; break;
+      case WEDNESDAY: ratio = wednesday; break;
+      case THURSDAY:  ratio = thursday; break;
+      case FRIDAY:    ratio = friday; break;
+      case SATURDAY:  ratio = saturday; break;
+      default:        ratio = 0.0; break;
+   }
+   if(ratio < 0.0)
+      ratio = 0.0;
+   return ratio;
+}
+
+//+------------------------------------------------------------------+
+//| Account-currency charge for one adverse swap night, per 1.0 lot. |
+//| A credit (positive swap) returns 0. The result is an estimate.    |
+//+------------------------------------------------------------------+
+bool SwapChargePerLot(const string symbol, bool isBuy, double openPrice, double &charge)
+{
+   charge = 0.0;
+   ENUM_SYMBOL_SWAP_MODE mode = (ENUM_SYMBOL_SWAP_MODE)SymbolInfoInteger(symbol, SYMBOL_SWAP_MODE);
+   if(mode == SYMBOL_SWAP_MODE_DISABLED)
+      return true;
+
+   double rate = SymbolInfoDouble(symbol, isBuy ? SYMBOL_SWAP_LONG : SYMBOL_SWAP_SHORT);
+   if(rate >= 0.0)
+      return true;
+
+   double magnitude = MathAbs(rate);
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double price = openPrice;
+   if(price <= 0.0)
+      price = SymbolInfoDouble(symbol, isBuy ? SYMBOL_ASK : SYMBOL_BID);
+
+   if(mode == SYMBOL_SWAP_MODE_POINTS ||
+      mode == SYMBOL_SWAP_MODE_REOPEN_CURRENT ||
+      mode == SYMBOL_SWAP_MODE_REOPEN_BID)
+   {
+      if(tickSize <= 0.0)
+         return false;
+      charge = magnitude * point * tickValue / tickSize;
+      return true;
+   }
+
+   if(mode == SYMBOL_SWAP_MODE_CURRENCY_DEPOSIT)
+   {
+      charge = magnitude;
+      return true;
+   }
+
+   string currency = "";
+   double amount = magnitude;
+   if(mode == SYMBOL_SWAP_MODE_CURRENCY_PROFIT)
+      currency = SymbolInfoString(symbol, SYMBOL_CURRENCY_PROFIT);
+   else if(mode == SYMBOL_SWAP_MODE_CURRENCY_SYMBOL)
+      currency = SymbolInfoString(symbol, SYMBOL_CURRENCY_BASE);
+   else if(mode == SYMBOL_SWAP_MODE_CURRENCY_MARGIN)
+      currency = SymbolInfoString(symbol, SYMBOL_CURRENCY_MARGIN);
+   else if(mode == SYMBOL_SWAP_MODE_INTEREST_CURRENT || mode == SYMBOL_SWAP_MODE_INTEREST_OPEN)
+   {
+      double contract = SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+      if(contract <= 0.0 || price <= 0.0)
+         return false;
+      amount = price * contract * magnitude / 100.0 / 360.0;
+      currency = SymbolInfoString(symbol, SYMBOL_CURRENCY_PROFIT);
+   }
+   else
+      return false;
+
+   return AccountValueOf(symbol, amount, currency, price, charge);
+}
+
+//+------------------------------------------------------------------+
+double SwapUnitsInHold(const string symbol)
+{
+   if(MaxHoldHours <= 0)
+      return 0.0;
+
+   datetime now = TimeCurrent();
+   datetime end = now + (datetime)MaxHoldHours * 3600;
+   MqlDateTime parts;
+   TimeToStruct(now, parts);
+   parts.hour = SwapChargeHour;
+   parts.min = SwapChargeMinute;
+   parts.sec = 0;
+   datetime cursor = StructToTime(parts);
+   if(cursor <= now)
+      cursor += 86400;
+
+   double units = 0.0;
+   for(int guard = 0; cursor <= end && guard < 40; guard++)
+   {
+      MqlDateTime when;
+      TimeToStruct(cursor, when);
+      units += NightRatio(symbol, (ENUM_DAY_OF_WEEK)when.day_of_week);
+      cursor += 86400;
+   }
+   return units;
+}
+
+//+------------------------------------------------------------------+
+bool ExpectedSwapPerLot(const string symbol, bool isBuy, double openPrice, double &cost)
+{
+   cost = 0.0;
+   if(!IncludeSwapInRisk || MaxHoldHours <= 0)
+      return true;
+
+   double oneNight = 0.0;
+   if(!SwapChargePerLot(symbol, isBuy, openPrice, oneNight))
+      return false;
+   cost = oneNight * SwapUnitsInHold(symbol);
+   return true;
+}
+
+//+------------------------------------------------------------------+
+double WorstEntry(bool isBuy, double entry)
+{
+   if(!SizeForSlippage || SlippageAllowancePoints <= 0)
+      return entry;
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double slip = SlippageAllowancePoints * point;
+   return isBuy ? entry + slip : entry - slip;
+}
+
+//+------------------------------------------------------------------+
+//| Price loss for 1.0 lot, plus per-lot fee and swap.               |
+//+------------------------------------------------------------------+
+bool LossPerLot(ENUM_ORDER_TYPE orderType, double entry, double stop, double extraPerLot, double &lossPerLot)
 {
    double profitAtStop = 0.0;
    if(!OrderCalcProfit(orderType, _Symbol, 1.0, entry, stop, profitAtStop))
@@ -308,7 +534,7 @@ bool LossPerLot(ENUM_ORDER_TYPE orderType, double entry, double stop, double &lo
       return false;
    }
 
-   lossPerLot = MathAbs(profitAtStop) + ExtraCostPerLot;
+   lossPerLot = MathAbs(profitAtStop) + ExtraCostPerLot + MathMax(0.0, extraPerLot);
    return true;
 }
 
@@ -316,7 +542,7 @@ bool LossPerLot(ENUM_ORDER_TYPE orderType, double entry, double stop, double &lo
 //| false means the profit calculation failed and the caller should  |
 //| retry. volume 0 with true means the trade is deliberately skipped.|
 //+------------------------------------------------------------------+
-bool CalculateVolume(ENUM_ORDER_TYPE orderType, double entry, double stop, double &volume)
+bool CalculateVolume(ENUM_ORDER_TYPE orderType, double entry, double stop, double extraPerLot, double &volume)
 {
    volume = 0.0;
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -326,7 +552,7 @@ bool CalculateVolume(ENUM_ORDER_TYPE orderType, double entry, double stop, doubl
       return true;
 
    double lossPerLot = 0.0;
-   if(!LossPerLot(orderType, entry, stop, lossPerLot))
+   if(!LossPerLot(orderType, entry, stop, extraPerLot, lossPerLot))
       return false;
    if(lossPerLot <= 0.0)
       return true;
@@ -743,7 +969,12 @@ bool OpenStopRisk(double &cash)
       double profit = 0.0;
       if(!OrderCalcProfit(orderType, symbol, volume, openPrice, sl, profit))
          return false;
-      cash += MathAbs(profit) + ExtraCostPerLot * volume;
+
+      double swap = 0.0;
+      bool isBuy = (orderType == ORDER_TYPE_BUY);
+      if(IncludeSwapInRisk && !ExpectedSwapPerLot(symbol, isBuy, openPrice, swap))
+         return false;
+      cash += MathAbs(profit) + (ExtraCostPerLot + MathMax(0.0, swap)) * volume;
    }
    return true;
 }
@@ -813,6 +1044,27 @@ bool ConfirmFill(bool isBuy, double requested, double stop, double target)
          continue;
 
       found = true;
+      double fill = trade.ResultPrice();
+      double adverse = 0.0;
+      if(fill > 0.0)
+         adverse = isBuy ? (fill - requested) : (requested - fill);
+      double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double stopDistance = MathAbs(requested - stop);
+      bool tooManyPoints = MaxAdverseSlippagePoints > 0 && point > 0.0 &&
+                           adverse > MaxAdverseSlippagePoints * point;
+      bool tooMuchOfStop = MaxAdverseSlippageStopPercent > 0.0 && stopDistance > 0.0 &&
+                           adverse > stopDistance * MaxAdverseSlippageStopPercent / 100.0;
+      if(adverse > 0.0 && (tooManyPoints || tooMuchOfStop))
+      {
+         AlertClose(StringFormat("Adverse slippage on %s is %.5f (requested %.5f, fill %.5f). Closing ticket %I64u.",
+                                 _Symbol, adverse, requested, fill, ticket));
+         if(!trade.PositionClose(ticket))
+            AlertClose(StringFormat("Slippage close failed: %u %s",
+                                    trade.ResultRetcode(),
+                                    trade.ResultRetcodeDescription()));
+         return false;
+      }
+
       if(PositionGetDouble(POSITION_SL) != 0.0 && PositionGetDouble(POSITION_TP) != 0.0)
          return true;
 
@@ -996,11 +1248,39 @@ EvalKind SendSetup(datetime barTime, EntrySetup &setup)
       return EVAL_DONE;
    }
 
+   double worst = WorstEntry(setup.isBuy, entry);
+   if(setup.isBuy && worst <= stop)
+   {
+      LogBar(barTime, "Trade skipped: slippage allowance consumes the whole stop distance.");
+      return EVAL_DONE;
+   }
+   if(!setup.isBuy && worst >= stop)
+   {
+      LogBar(barTime, "Trade skipped: slippage allowance consumes the whole stop distance.");
+      return EVAL_DONE;
+   }
+
+   double swapPerLot = 0.0;
+   if(!ExpectedSwapPerLot(_Symbol, setup.isBuy, worst, swapPerLot))
+   {
+      LogBar(barTime, "Trade skipped: swap could not be converted into account currency.");
+      return EVAL_DONE;
+   }
+
    double volume = 0.0;
-   if(!CalculateVolume(type, entry, stop, volume))
+   if(!CalculateVolume(type, worst, stop, swapPerLot, volume))
       return EVAL_RETRY;
    if(volume <= 0.0)
       return EVAL_DONE;
+
+   double equityNow = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskCash = equityNow * RiskPercent / 100.0;
+   if(MaxSwapToRiskPercent > 0.0 && riskCash > 0.0 &&
+      swapPerLot * volume > riskCash * MaxSwapToRiskPercent / 100.0)
+   {
+      LogBar(barTime, "Trade skipped: estimated swap is too large a share of the risk budget.");
+      return EVAL_DONE;
+   }
 
    if(MaxTotalRiskPercent > 0.0)
    {
@@ -1011,10 +1291,10 @@ EvalKind SendSetup(datetime barTime, EntrySetup &setup)
          return EVAL_RETRY;
       }
       double oneLot = 0.0;
-      if(!LossPerLot(type, entry, stop, oneLot))
+      if(!LossPerLot(type, worst, stop, swapPerLot, oneLot))
          return EVAL_RETRY;
-      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-      if(equity <= 0.0 || openRisk + oneLot * volume > equity * MaxTotalRiskPercent / 100.0)
+      double eqRisk = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(eqRisk <= 0.0 || openRisk + oneLot * volume > eqRisk * MaxTotalRiskPercent / 100.0)
       {
          LogBar(barTime, "Trade skipped: MaxTotalRiskPercent would be exceeded.");
          return EVAL_DONE;
@@ -1026,8 +1306,8 @@ EvalKind SendSetup(datetime barTime, EntrySetup &setup)
       double requiredMargin = 0.0;
       if(!OrderCalcMargin(type, _Symbol, volume, entry, requiredMargin))
          return EVAL_RETRY;
-      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-      if(equity <= 0.0 || requiredMargin > equity * MaxMarginEquityPercent / 100.0 ||
+      double eqMargin = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(eqMargin <= 0.0 || requiredMargin > eqMargin * MaxMarginEquityPercent / 100.0 ||
          requiredMargin > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
       {
          LogBar(barTime, "Trade skipped: margin cap/free-margin check.");
@@ -1125,6 +1405,8 @@ int OnInit()
    nextHistoryLog = 0;
    entryLockHeld = false;
    baselineGuardHeld = "";
+   lastAlgoFlag = -1;
+   lastHeartbeat = 0;
 
    if(RestrictToPrimeXBTStandardSymbols && !IsAllowedSymbol())
    {
@@ -1169,7 +1451,17 @@ int OnInit()
       MaxEntryDelaySeconds < 0 || MaxEntryDelaySeconds > 1800 ||
       MaxOpenPositions < 0 ||
       MaxTotalRiskPercent < 0.0 || MaxTotalRiskPercent > 100.0 ||
-      ExtraCostPerLot < 0.0)
+      ExtraCostPerLot < 0.0 ||
+      MaxHoldHours < 0 || MaxHoldHours > 24 * 30 ||
+      MaxSwapToRiskPercent < 0.0 || MaxSwapToRiskPercent > 100.0 ||
+      SwapChargeHour < 0 || SwapChargeHour > 23 ||
+      SwapChargeMinute < 0 || SwapChargeMinute > 59 ||
+      ExitMinutesBeforeSwap < 0 || ExitMinutesBeforeSwap > 12 * 60 ||
+      SlippageAllowancePoints < 0 ||
+      MaxAdverseSlippagePoints < 0 ||
+      MaxAdverseSlippageStopPercent < 0.0 || MaxAdverseSlippageStopPercent > 100.0 ||
+      DailyLimitTightenPercent <= 0.0 || DailyLimitTightenPercent > 100.0 ||
+      HeartbeatSeconds < 1 || HeartbeatSeconds > 3600)
    {
       Print("Invalid input parameters.");
       return INIT_PARAMETERS_INCORRECT;
@@ -1227,7 +1519,18 @@ int OnInit()
          Print("Daily baseline is not set. Entries stay off and open positions are not closed.");
    }
 
-   Print("EA 1.40 initialized on ", _Symbol,
+   double buySwap = 0.0;
+   double sellSwap = 0.0;
+   double refPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   bool buySwapOk = ExpectedSwapPerLot(_Symbol, true, refPrice, buySwap);
+   bool sellSwapOk = ExpectedSwapPerLot(_Symbol, false, SymbolInfoDouble(_Symbol, SYMBOL_BID), sellSwap);
+   Print("Swap mode ", EnumToString((ENUM_SYMBOL_SWAP_MODE)SymbolInfoInteger(_Symbol, SYMBOL_SWAP_MODE)),
+         " over ", MaxHoldHours, "h. Estimated charge per lot buy ",
+         buySwapOk ? DoubleToString(buySwap, 2) : "unpriced",
+         " sell ", sellSwapOk ? DoubleToString(sellSwap, 2) : "unpriced",
+         ". No DLL is used. Server-side stops are the protection while Algo Trading is off.");
+
+   Print("EA 1.41 initialized on ", _Symbol,
          ". Signals use H4 and M30. Server time: ",
          TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS));
 
@@ -1246,15 +1549,373 @@ void OnDeinit(const int reason)
       Release(baselineGuardHeld);
    baselineGuardHeld = "";
    ReleaseIndicators();
+   Comment("");
+}
+
+//+------------------------------------------------------------------+
+string StateName(int state)
+{
+   if(state == 1) return "PAUSED";
+   if(state == 2) return "LOCKED";
+   if(state == 3) return "FLATTEN";
+   if(state == 4) return "ALGO_OFF";
+   return "RUNNING";
+}
+
+//+------------------------------------------------------------------+
+int EffectiveState(DailyState daily)
+{
+   if(!TradeAllowed())
+      return 4;
+   if(EaCommand == EA_CMD_FLATTEN)
+      return 3;
+   if(daily == DAILY_LOCKED)
+      return 2;
+   if(EaCommand == EA_CMD_PAUSED || !EnableNewEntries)
+      return 1;
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+void PublishHeartbeat(int state)
+{
+   if(!WriteHeartbeat && !WriteHeartbeatFile)
+      return;
+
+   datetime now = TimeCurrent();
+   if(lastHeartbeat != 0 && now - lastHeartbeat < HeartbeatSeconds)
+      return;
+   lastHeartbeat = now;
+
+   long login = (long)AccountInfoInteger(ACCOUNT_LOGIN);
+   string beatKey = StringFormat("PXBTSTD_CRYPTO_%I64d_BEAT", login);
+   string stateKey = StringFormat("PXBTSTD_CRYPTO_%I64d_STATE", login);
+   if(WriteHeartbeat)
+   {
+      GlobalVariableSet(beatKey, (double)now);
+      GlobalVariableSet(stateKey, (double)state);
+   }
+
+   if(!WriteHeartbeatFile || MQLInfoInteger(MQL_TESTER))
+      return;
+
+   string name = StringFormat("PrimeMeta5_%I64d.heartbeat.txt", login);
+   int handle = FileOpen(name, FILE_WRITE|FILE_TXT|FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+   {
+      Print("Heartbeat file was not written. Error ", GetLastError());
+      return;
+   }
+   FileWriteString(handle, "time="+TimeToString(now, TIME_DATE|TIME_SECONDS)+"\r\n");
+   FileWriteString(handle, "state="+StateName(state)+"\r\n");
+   FileWriteString(handle, "algo="+(TradeAllowed() ? "1" : "0")+"\r\n");
+   FileWriteString(handle, "symbol="+_Symbol+"\r\n");
+   FileWriteString(handle, "equity="+DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2)+"\r\n");
+   FileClose(handle);
+}
+
+//+------------------------------------------------------------------+
+void NotifyAlgoOff(int state);
+
+void NoteAlgoTransition(int state)
+{
+   int flag = TradeAllowed() ? 1 : 0;
+   if(lastAlgoFlag == -1)
+   {
+      lastAlgoFlag = flag;
+      if(flag == 0)
+         NotifyAlgoOff(state);
+      return;
+   }
+   if(lastAlgoFlag == flag)
+      return;
+
+   lastAlgoFlag = flag;
+   if(flag == 0)
+      NotifyAlgoOff(state);
+   else
+      Print("Algorithmic trading is back on ", _Symbol, ". Protective closes and stop updates resume on this tick.");
+}
+
+//+------------------------------------------------------------------+
+void NotifyAlgoOff(int state)
+{
+   string text = StringFormat("PrimeMeta5 %s Algo Trading is OFF. State %s. Server-side stops remain, but this EA cannot close or move positions until the button is on.",
+                              _Symbol, StateName(state));
+   Print(text);
+   if(AlertOnAlgoOff)
+      Alert(text);
+   if(PushOnAlgoOff && !MQLInfoInteger(MQL_TESTER))
+   {
+      if(!SendNotification(text))
+         Print("Push notification was not sent. Error ", GetLastError(),
+               ". Set a MetaQuotes ID in Tools, Options, Notifications.");
+   }
+   if(EmailOnAlgoOff && !MQLInfoInteger(MQL_TESTER))
+   {
+      if(!SendMail("PrimeMeta5 algorithmic trading is off", text))
+         Print("Email was not sent. Error ", GetLastError(),
+               ". Configure Tools, Options, Email.");
+   }
+}
+
+//+------------------------------------------------------------------+
+void ShowState(int state, DailyState daily)
+{
+   double baseline = 0.0;
+   double lossCash = 0.0;
+   double lossPct = 0.0;
+   string lossText = "n/a";
+   datetime since = 0;
+   if(ReadBaseline(baseline, since) && baseline > 0.0)
+   {
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      double adjusted = equity;
+      double cash = 0.0;
+      if(!ExcludeNonTradeCashflows || (since > 0 && NonTradeCashSince(since, cash)))
+      {
+         if(ExcludeNonTradeCashflows)
+            adjusted = equity - cash;
+         lossCash = baseline - adjusted;
+         lossPct = lossCash / baseline * 100.0;
+         lossText = StringFormat("%.2f%% of %.2f%%", lossPct, DailyLossLimitPercent);
+      }
+   }
+   else if(daily == DAILY_NO_BASELINE)
+      lossText = "baseline not set";
+
+   string body = StringFormat("PrimeMeta5 1.41  %s\nState: %s\nCommand: %s\nAlgo trading: %s\nDaily loss: %s\nHeartbeat: %s\nServer-side stops stay on the broker. This terminal cannot change them while Algo Trading is off.",
+                              _Symbol,
+                              StateName(state),
+                              EnumToString(EaCommand),
+                              TradeAllowed() ? "ON" : "OFF",
+                              lossText,
+                              TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS));
+   Comment(body);
+}
+
+//+------------------------------------------------------------------+
+bool CurrentLossCash(double &baseline, double &lossCash)
+{
+   baseline = 0.0;
+   lossCash = 0.0;
+   datetime since = 0;
+   if(!ReadBaseline(baseline, since) || baseline <= 0.0)
+      return false;
+
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double adjusted = equity;
+   if(ExcludeNonTradeCashflows)
+   {
+      if(since <= 0)
+         return false;
+      double cash = 0.0;
+      if(!NonTradeCashSince(since, cash))
+         return false;
+      adjusted = equity - cash;
+   }
+   lossCash = baseline - adjusted;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+void TightenStops()
+{
+   if(!TightenStopsNearDailyLimit || DailyLossLimitPercent <= 0.0)
+      return;
+
+   double baseline = 0.0;
+   double lossCash = 0.0;
+   if(!CurrentLossCash(baseline, lossCash))
+      return;
+
+   double lossPct = lossCash / baseline * 100.0;
+   double trigger = DailyLossLimitPercent * DailyLimitTightenPercent / 100.0;
+   if(lossPct < trigger)
+      return;
+
+   double budget = baseline * DailyLossLimitPercent / 100.0;
+   double remaining = budget - lossCash;
+   if(remaining <= 0.0)
+      return;
+
+   double openRisk = 0.0;
+   if(!OpenStopRisk(openRisk) || openRisk <= remaining)
+      return;
+
+   double scale = remaining / openRisk;
+   int total = PositionsTotal();
+   ulong tickets[];
+   ArrayResize(tickets, total);
+   int n = 0;
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+         continue;
+      if(!CloseAllMagicOnDailyLock && PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      tickets[n++] = ticket;
+   }
+
+   for(int k = 0; k < n; k++)
+   {
+      if(!PositionSelectByTicket(tickets[k]))
+         continue;
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      bool isBuy = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL);
+      double tp = PositionGetDouble(POSITION_TP);
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      if(sl <= 0.0 || openPrice <= 0.0 || volume <= 0.0)
+         continue;
+
+      ENUM_ORDER_TYPE orderType = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      double profit = 0.0;
+      if(!OrderCalcProfit(orderType, symbol, volume, openPrice, sl, profit))
+         continue;
+      double currentLoss = MathAbs(profit);
+      if(currentLoss <= 0.0)
+         continue;
+
+      double targetLoss = currentLoss * scale;
+      double oldDist = MathAbs(openPrice - sl);
+      if(oldDist <= 0.0)
+         continue;
+      double newDist = oldDist * (targetLoss / currentLoss);
+
+      MqlTick tick;
+      if(!SymbolInfoTick(symbol, tick))
+         continue;
+      double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      long stopsLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+      double minDist = (double)stopsLevel * point;
+      double closest = isBuy ? tick.bid - minDist : tick.ask + minDist;
+      double proposed = isBuy ? openPrice - newDist : openPrice + newDist;
+      proposed = NormalizePriceSymbol(symbol, proposed);
+
+      double profitClosest = 0.0;
+      if(!OrderCalcProfit(orderType, symbol, volume, openPrice, closest, profitClosest))
+         continue;
+      if(targetLoss + 1e-8 < MathAbs(profitClosest))
+      {
+         AlertClose(StringFormat("Cannot tighten %s inside the remaining daily budget. Closing ticket %I64u.",
+                                 symbol, tickets[k]));
+         if(!trade.PositionClose(tickets[k]))
+            AlertClose(StringFormat("Budget close failed: %u %s",
+                                    trade.ResultRetcode(),
+                                    trade.ResultRetcodeDescription()));
+         continue;
+      }
+
+      if(isBuy)
+      {
+         if(proposed > closest)
+            proposed = NormalizePriceSymbol(symbol, closest);
+         if(proposed <= sl)
+            continue;
+      }
+      else
+      {
+         if(proposed < closest)
+            proposed = NormalizePriceSymbol(symbol, closest);
+         if(proposed >= sl)
+            continue;
+      }
+
+      if(MathAbs(proposed - sl) < point)
+         continue;
+      if(!trade.PositionModify(tickets[k], proposed, tp))
+         Print("Stop tighten failed on ", symbol, ": ", trade.ResultRetcode(),
+               " ", trade.ResultRetcodeDescription());
+   }
+}
+
+//+------------------------------------------------------------------+
+bool InTripleSwapWindow()
+{
+   if(!ExitBeforeTripleSwap || ExitMinutesBeforeSwap <= 0)
+      return false;
+
+   datetime now = TimeCurrent();
+   MqlDateTime parts;
+   TimeToStruct(now, parts);
+   parts.hour = SwapChargeHour;
+   parts.min = SwapChargeMinute;
+   parts.sec = 0;
+   datetime charge = StructToTime(parts);
+   if(now >= charge)
+      return false;
+   if((charge - now) > (datetime)ExitMinutesBeforeSwap * 60)
+      return false;
+
+   double ratio = NightRatio(_Symbol, (ENUM_DAY_OF_WEEK)parts.day_of_week);
+   return (ratio >= 2.5);
+}
+
+//+------------------------------------------------------------------+
+void CloseForHoldAndSwap()
+{
+   bool triple = InTripleSwapWindow();
+   if(!triple && !CloseAfterMaxHold)
+      return;
+
+   datetime oldest = 0;
+   if(CloseAfterMaxHold && MaxHoldHours > 0)
+      oldest = TimeCurrent() - (datetime)MaxHoldHours * 3600;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+         continue;
+
+      bool aged = (CloseAfterMaxHold && MaxHoldHours > 0 &&
+                   (datetime)PositionGetInteger(POSITION_TIME) <= oldest);
+      if(!triple && !aged)
+         continue;
+
+      string why = triple ? "triple-swap window" : "max hold time";
+      Print("Closing ", _Symbol, " ticket ", ticket, " for ", why, ".");
+      if(!trade.PositionClose(ticket))
+         AlertClose(StringFormat("Scheduled close failed: %u %s",
+                                 trade.ResultRetcode(),
+                                 trade.ResultRetcodeDescription()));
+   }
 }
 
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   DailyState daily = DailyLossState();
+   int state = EffectiveState(daily);
+   NoteAlgoTransition(state);
+   ShowState(state, daily);
+   PublishHeartbeat(state);
+
+   // No trade request can succeed while the terminal button is off.
+   // Existing broker-side stops remain. Pending protection runs on the next allowed tick.
+   if(!TradeAllowed())
+      return;
+
+   if(EaCommand == EA_CMD_FLATTEN)
+   {
+      CloseMagicPositions(true);
+      return;
+   }
+
    ProtectNakedPositions();
+   TightenStops();
+   CloseForHoldAndSwap();
 
    // Safety management runs on every tick, not just new M30 bars.
-   DailyState daily = DailyLossState();
    if(daily == DAILY_LOCKED)
    {
       CloseMagicPositions(CloseAllMagicOnDailyLock);
@@ -1269,6 +1930,9 @@ void OnTick()
       CloseMagicPositions(false);
       return;
    }
+
+   if(EaCommand == EA_CMD_PAUSED || !EnableNewEntries)
+      return;
 
    // Entry signals are evaluated once the M30 bar is ready, inside the delay window.
    datetime barTime = iTime(_Symbol, PERIOD_M30, 0);

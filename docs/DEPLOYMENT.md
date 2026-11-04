@@ -198,7 +198,7 @@ Restarts:
 
 Updates to the EA:
 
-- This repository's source is v1.30 unchanged. A future patch from [AUDIT.md](AUDIT.md) should be a separate change, compiled, then walked through stages B–D again. Do not drop a new `.ex5` onto a live book and assume open positions will be adopted. The source does not modify positions it did not just open, but it will close positions of the same symbol and magic when the lock or the end-of-day input says so.
+- Recompile after pulling a new version and walk stages B–D again before raising size. Do not drop a new `.ex5` onto a live book and assume open positions will be adopted. v1.41 can move stops when the daily loss nears the limit, and it can close a fill that slipped too far. Those actions apply to positions with this magic.
 - Inputs persist per chart. Changing them re-runs `OnInit`, which records the current bar and skips it, and which will not reset an existing baseline key.
 - Synchronize an MQL5 VPS again after any local change. It does not pick up files on its own.
 
@@ -207,6 +207,47 @@ Emergency:
 1. Close the positions in the Trade tab (or with a one-off script you trust). Do not rely on the Algo Trading button.
 2. Then turn algorithmic trading off, or stop the VPS rental.
 3. If you turn the button back on the same server day, a `LOCK` key that already exists will start closing again as soon as ticks arrive. That is what the key is for. Remove it only if you intend to trade again the same day, and write down why.
+
+## Push notifications, email, and the watchdog
+
+v1.41 cannot turn the Algo Trading button back on. There is no DLL in this repository. The protection that still works with the button off is the stop and target already sitting on the position at the broker. The chart comment shows `ALGO_OFF` while the button is off. The next tick after you turn it on runs any close or stop update that was waiting.
+
+### Push
+
+1. In the desktop terminal: Tools → Options → Notifications.
+2. Enable notifications and set the MetaQuotes ID from the MetaTrader mobile app (the terminal shows the link on that page).
+3. Leave `PushOnAlgoOff` at its default `true`.
+4. Turn Algo Trading off once on a demo chart and confirm the phone receives "Algo Trading is OFF". The Experts log records the same text. If the send fails, the log includes the platform error and points back at this options page.
+
+`AlertOnAlgoOff` also raises a terminal alert. That needs no extra setup.
+
+### Email
+
+1. Tools → Options → Email. Fill in the SMTP server, login, password, and the from/to addresses the terminal asks for. Send the test message from that dialog before trusting the EA.
+2. Set `EmailOnAlgoOff` to `true` on the charts. The default is false, so nothing is emailed until you do this.
+3. The subject is `PrimeMeta5 algorithmic trading is off`.
+
+### Heartbeat
+
+With the defaults, every 10 seconds the EA writes:
+
+- Terminal global variables `PXBTSTD_CRYPTO_<account>_BEAT` (server time of the last update, as a number) and `PXBTSTD_CRYPTO_<account>_STATE` (`0` running, `1` paused, `2` daily lock, `3` flatten, `4` algo off). Open them with Tools → Global Variables, or F3.
+- A text file `<data folder>\MQL5\Files\PrimeMeta5_<account>.heartbeat.txt`. File → Open Data Folder, then `MQL5\Files`. The file contains `time`, `state`, `algo` (`1` or `0`), `symbol`, and `equity`.
+
+The Strategy Tester does not write that file. The global variables inside a test belong to the testing agent, not to the live terminal.
+
+A watchdog is any program on the same machine that reads the file or the global-variable age and tells you when it goes stale. One Windows scheduled task, every minute, is enough. Point it at the file and treat an age greater than a few heartbeat intervals, or a `state` of `ALGO_OFF`, as the page. The EA does not start that task for you. Example check, with the data-folder path filled in:
+
+```powershell
+$path = "C:\Users\Public\Documents\MetaQuotes\Terminal\<id>\MQL5\Files\PrimeMeta5_<login>.heartbeat.txt"
+$age = (Get-Date) - (Get-Item $path).LastWriteTime
+if ($age.TotalSeconds -gt 60) { Write-Output "heartbeat stale" }
+Select-String -Path $path -Pattern "^state="
+```
+
+The `<id>` folder is the hash under the terminal's data directory, not a fixed path. A stale file means the terminal is not ticking. It does not, by itself, close positions. The broker-side stops are what limit the loss during that gap.
+
+`WriteHeartbeat` and `WriteHeartbeatFile` can each be turned off. `HeartbeatSeconds` is the minimum gap between updates.
 
 ## CI compile workflow
 
